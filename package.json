@@ -1,6 +1,6 @@
 {
   "name": "@vzbb-db-system/core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Booking Engine: Google Sheets (через Apps Script) + Passwordless Auth (Magic Links)",
   "license": "MIT",
   "main": "dist/index.js",
