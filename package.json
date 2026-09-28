@@ -26,7 +26,8 @@
   "dependencies": {
     "jsonwebtoken": "^9.0.3",
     "nodemailer": "^6.9.16",
-    "resend": "^4.8.0"
+    "resend": "^4.8.0",
+    "@supabase/supabase-js": "^2.45.0"
   },
   "devDependencies": {
     "@types/jsonwebtoken": "^9.0.7",

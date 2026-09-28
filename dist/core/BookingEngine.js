@@ -1,9 +1,6 @@
 "use strict";
 // src/core/BookingEngine.ts
-// Ядро библиотеки. Ничего не знает про Google Sheets/Resend/Redis конкретно —
-// работает только через интерфейсы IBookingStorage / IEmailProvider / ILockProvider,
-// которые передаются снаружи (Dependency Injection). Это и делает движок BaaS-подобным:
-// подключается в любой Next.js App Router проект как обычная библиотека.
+// Ядро библиотеки. Работает только через интерфейсы IBookingStorage / IEmailProvider / ILockProvider.
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.BookingEngine = exports.BookingEngineError = void 0;
 const crypto_1 = require("crypto");
@@ -14,7 +11,7 @@ const DEFAULT_PENDING_TTL_MINUTES = 15;
 const DEFAULT_CONFIRM_TOKEN_TTL_MINUTES = 30;
 const DEFAULT_LOGIN_TOKEN_TTL_MINUTES = 15;
 const DEFAULT_SESSION_TTL_DAYS = 30;
-const LOCK_TTL_MS = 3000; // окно жёсткой блокировки слота на время транзакции записи
+const LOCK_TTL_MS = 3000;
 class BookingEngineError extends Error {
     constructor(message, code) {
         super(message);
@@ -25,6 +22,7 @@ class BookingEngineError extends Error {
 exports.BookingEngineError = BookingEngineError;
 class BookingEngine {
     constructor(config) {
+        this.resourcesCache = null;
         this.storage = config.storage;
         this.emailProvider = config.emailProvider;
         this.lockProvider = config.lockProvider ?? new MemoryLockAdapter_1.MemoryLockAdapter();
@@ -34,57 +32,76 @@ class BookingEngine {
         this.confirmTokenTtlMinutes = config.confirmTokenTtlMinutes ?? DEFAULT_CONFIRM_TOKEN_TTL_MINUTES;
         this.loginTokenTtlMinutes = config.loginTokenTtlMinutes ?? DEFAULT_LOGIN_TOKEN_TTL_MINUTES;
         this.sessionTtlDays = config.sessionTtlDays ?? DEFAULT_SESSION_TTL_DAYS;
+        this.waitUntil = config.waitUntil;
     }
     slotKey(resourceId, startTime, endTime) {
         return `slot:${resourceId}:${startTime}:${endTime}`;
     }
-    /**
-     * Запускает фоновое действие, не блокируя ответ пользователю.
-     * Используется для логов и писем, которые не влияют на результат запроса.
-     * Ошибки логируются, чтобы не ронять весь запрос из-за необязательных операций.
-     */
+    // FIX: пробрасываем promise в waitUntil, если передан (serverless).
     fireAndForget(promise, context) {
-        promise.catch((err) => {
+        const safe = promise.catch((err) => {
             console.error(`[BookingEngine] ${context} (фоновое действие):`, err);
         });
+        this.waitUntil?.(safe);
     }
-    /** Проверяет, блокирует ли какая-либо бронь слот указанного работника. */
+    // FIX: маппинг статусов составных операций в BookingEngineError.
+    throwStatus(status) {
+        const map = {
+            NOT_FOUND: "Запись не найдена",
+            CANCELLED: "Запись была отменена",
+            EXPIRED: "Время удержания слота истекло, запись отменена",
+            FORBIDDEN: "Нет доступа к этой записи",
+            SLOT_TAKEN: "Выбранное время уже занято",
+        };
+        throw new BookingEngineError(map[status] ?? "Ошибка хранилища", status);
+    }
     isBlocked(bookings, resourceId, startTime, endTime, staleBefore, excludeBookingId) {
         return bookings.some((b) => {
             if (excludeBookingId && b.id === excludeBookingId)
                 return false;
             if (b.resourceId !== resourceId)
-                return false; // занятость у каждого работника своя
+                return false;
             if (b.status === "CANCELLED")
                 return false;
             if (b.status === "PENDING" && b.createdAt < staleBefore)
-                return false; // слот освобождён
+                return false;
             return (0, dates_1.isRangeOverlap)(b.startTime, b.endTime, startTime, endTime);
         });
     }
-    /** true, если слот свободен у указанного работника. */
     async isSlotAvailable(startTime, endTime, resourceId, excludeBookingId) {
         const overlapping = await this.storage.findBookingsInRange(startTime, endTime);
         const staleBefore = (0, dates_1.minutesAgoIso)(this.pendingTtlMinutes);
         return !this.isBlocked(overlapping, resourceId, startTime, endTime, staleBefore, excludeBookingId);
     }
+    // FIX: список мастеров кэшируется на 60 сек; инвалидируется в create/delete.
     async listResources() {
-        return this.storage.listResources();
+        const c = this.resourcesCache;
+        if (c && Date.now() - c.at < 60_000)
+            return c.data;
+        const data = await this.storage.listResources();
+        this.resourcesCache = { at: Date.now(), data };
+        return data;
+    }
+    invalidateResourcesCache() {
+        this.resourcesCache = null;
     }
     async createResource(input) {
-        return this.storage.createResource(input);
+        const r = await this.storage.createResource(input);
+        this.invalidateResourcesCache();
+        return r;
     }
     async deleteResource(resourceId) {
         await this.storage.deleteResource(resourceId);
+        this.invalidateResourcesCache();
     }
-    /**
-     * Календарь занятости: разбивает диапазон на слоты и для каждого возвращает,
-     * какие работники свободны. Удобно для показа клиентам свободных окон.
-     */
     async getAvailability(startTime, endTime, slotMinutes) {
-        const resources = await this.storage.listResources();
-        const bookings = await this.storage.findBookingsInRange(startTime, endTime);
         const staleBefore = (0, dates_1.minutesAgoIso)(this.pendingTtlMinutes);
+        const { resources, bookings } = this.storage.getAvailabilityData
+            ? await this.storage.getAvailabilityData(startTime, endTime, staleBefore)
+            : await Promise.all([
+                this.listResources(),
+                this.storage.findBookingsInRange(startTime, endTime),
+            ]).then(([resources, bookings]) => ({ resources, bookings }));
         const slots = (0, dates_1.generateSlots)(startTime, endTime, slotMinutes).map((s) => ({
             ...s,
             freeResourceIds: resources
@@ -93,11 +110,7 @@ class BookingEngine {
         }));
         return { resources, slots };
     }
-    /**
-     * Шаг 1 Flow нового/существующего пользователя: пользователь отправил форму.
-     * Создаёт PENDING-бронь, удерживающую слот pendingTtlMinutes минут, и шлёт письмо
-     * со ссылкой подтверждения /api/confirm?token=...
-     */
+    // ---------- Booking flow ----------
     async requestBooking(input) {
         const resourceId = input.resourceId ?? "";
         const key = this.slotKey(resourceId, input.startTime, input.endTime);
@@ -113,7 +126,6 @@ class BookingEngine {
                 name: input.name,
                 phone: input.phone,
             });
-            // Атомарное "проверка + запись" за один round-trip, если хранилище поддерживает.
             let booking;
             if (this.storage.reserveSlot) {
                 const result = await this.storage.reserveSlot({
@@ -135,9 +147,8 @@ class BookingEngine {
             }
             else {
                 const available = await this.isSlotAvailable(input.startTime, input.endTime, resourceId);
-                if (!available) {
+                if (!available)
                     throw new BookingEngineError("Выбранное время уже занято", "SLOT_TAKEN");
-                }
                 booking = await this.storage.createBooking({
                     id: bookingId,
                     userEmail: input.userEmail,
@@ -173,29 +184,35 @@ class BookingEngine {
             await release();
         }
     }
-    /** Шаг 2: переход по ссылке из письма подтверждения. */
     async confirmBooking(token) {
         const payload = (0, jwt_1.verifyToken)(token, this.jwtSecret);
         if (!payload || payload.purpose !== "confirm_booking" || !payload.bookingId) {
             throw new BookingEngineError("Недействительная или просроченная ссылка", "INVALID_TOKEN");
         }
-        const booking = await this.storage.findBookingById(payload.bookingId);
-        if (!booking) {
-            throw new BookingEngineError("Запись не найдена", "NOT_FOUND");
+        // NEW: если хранилище умеет составной confirm — один round-trip.
+        if (this.storage.confirmBooking) {
+            const r = await this.storage.confirmBooking({
+                bookingId: payload.bookingId,
+                staleBefore: (0, dates_1.minutesAgoIso)(this.pendingTtlMinutes),
+            });
+            if (r.status !== "OK")
+                this.throwStatus(r.status);
+            return r.booking;
         }
+        // Fallback
+        const booking = await this.storage.findBookingById(payload.bookingId);
+        if (!booking)
+            throw new BookingEngineError("Запись не найдена", "NOT_FOUND");
         if (booking.status === "CANCELLED") {
             throw new BookingEngineError("Запись была отменена", "CANCELLED");
         }
-        if (booking.status === "CONFIRMED") {
-            return booking; // повторный переход по той же ссылке — идемпотентно
-        }
+        if (booking.status === "CONFIRMED")
+            return booking;
         const staleBefore = (0, dates_1.minutesAgoIso)(this.pendingTtlMinutes);
         if (booking.createdAt < staleBefore) {
             await this.storage.updateBookingStatus(booking.id, "CANCELLED");
             throw new BookingEngineError("Время удержания слота истекло, запись отменена", "EXPIRED");
         }
-        // Обновление статуса и проверка/создание пользователя — независимые операции,
-        // выполняем их параллельно, чтобы сократить время ответа.
         await Promise.all([
             this.storage.updateBookingStatus(booking.id, "CONFIRMED"),
             this.ensureUser(booking),
@@ -208,7 +225,6 @@ class BookingEngine {
         }), "лог BOOKING_CONFIRMED");
         return { ...booking, status: "CONFIRMED" };
     }
-    /** Создаёт пользователя, если его ещё нет (идемпотентно). */
     async ensureUser(booking) {
         const existing = await this.storage.findUserByEmail(booking.userEmail);
         if (existing)
@@ -220,14 +236,10 @@ class BookingEngine {
             phone: serviceData?.phone ?? "",
         });
     }
-    /** Flow существующего пользователя, шаг 1: запрос magic link по email. */
     async requestLogin(email) {
         const user = await this.storage.findUserByEmail(email);
-        if (!user) {
-            // Намеренно не сообщаем вызывающей стороне, есть ли такой email в базе —
-            // ответ на фронтенде должен быть одинаковым в обоих случаях.
+        if (!user)
             return;
-        }
         const token = (0, jwt_1.signToken)({ purpose: "login", email }, this.jwtSecret, this.loginTokenTtlMinutes);
         const loginUrl = `${this.baseUrl}/api/login?token=${encodeURIComponent(token)}`;
         this.fireAndForget(this.storage.appendLog({
@@ -244,10 +256,6 @@ class BookingEngine {
 <p>Ссылка действительна ${this.loginTokenTtlMinutes} минут.</p>`,
         }), "письмо для входа");
     }
-    /**
-     * Flow существующего пользователя, шаг 2: переход по magic link.
-     * Возвращает данные, которые API route должен положить в HTTP-only cookie.
-     */
     async verifyLoginToken(token) {
         const payload = (0, jwt_1.verifyToken)(token, this.jwtSecret);
         if (!payload || payload.purpose !== "login" || !payload.email) {
@@ -262,14 +270,12 @@ class BookingEngine {
         }), "лог LOGIN_SUCCESS");
         return { email: payload.email, sessionToken, sessionTtlDays: this.sessionTtlDays };
     }
-    /** Проверка session-cookie — используйте в middleware/API роутах дашборда. */
     verifySession(sessionToken) {
         const payload = (0, jwt_1.verifyToken)(sessionToken, this.jwtSecret);
         if (!payload || payload.purpose !== "session" || !payload.email)
             return null;
         return { email: payload.email };
     }
-    /** Создаёт сессионный токен для email (например, сразу после подтверждения брони). */
     createSession(email) {
         const sessionToken = (0, jwt_1.signToken)({ purpose: "session", email }, this.jwtSecret, this.sessionTtlDays * 24 * 60);
         return { sessionToken, sessionTtlDays: this.sessionTtlDays };
@@ -277,28 +283,26 @@ class BookingEngine {
     async listUserBookings(email) {
         return this.storage.listBookingsByUser(email);
     }
-    // --- Административные методы (для CRM) ---
-    async listAllBookings() {
-        return this.storage.listBookings();
-    }
-    async listUsers() {
-        return this.storage.listUsers();
-    }
-    async listLogs() {
-        return this.storage.listLogs();
-    }
-    async deleteBooking(bookingId) {
-        await this.storage.deleteBooking(bookingId);
-    }
-    /** Прямое изменение статуса (для CRM, без проверки владельца). */
+    // ---------- Админ ----------
+    async listAllBookings() { return this.storage.listBookings(); }
+    async listUsers() { return this.storage.listUsers(); }
+    async listLogs() { return this.storage.listLogs(); }
+    async deleteBooking(bookingId) { await this.storage.deleteBooking(bookingId); }
     async setBookingStatus(bookingId, status) {
         await this.storage.updateBookingStatus(bookingId, status);
     }
-    /** Пересобрать человекочитаемый лист «Отчёт» (если хранилище поддерживает). */
     async rebuildReport() {
         await this.storage.rebuildReport?.();
     }
     async cancelBooking(bookingId, requesterEmail) {
+        // NEW: если хранилище умеет — один round-trip (проверка владельца + patch + лог).
+        if (this.storage.cancelBooking) {
+            const r = await this.storage.cancelBooking({ bookingId, requesterEmail });
+            if (r.status !== "OK")
+                this.throwStatus(r.status);
+            return;
+        }
+        // Fallback
         const booking = await this.storage.findBookingById(bookingId);
         if (!booking)
             throw new BookingEngineError("Запись не найдена", "NOT_FOUND");
@@ -314,11 +318,28 @@ class BookingEngine {
         }), "лог BOOKING_CANCELLED");
     }
     async rescheduleBooking(bookingId, requesterEmail, newStartTime, newEndTime) {
+        // NEW: если хранилище умеет — один round-trip, вся проверка под его LockService.
+        if (this.storage.rescheduleBooking) {
+            const r = await this.storage.rescheduleBooking({
+                bookingId,
+                requesterEmail,
+                startTime: newStartTime,
+                endTime: newEndTime,
+                staleBefore: (0, dates_1.minutesAgoIso)(this.pendingTtlMinutes),
+            });
+            if (r.status !== "OK")
+                this.throwStatus(r.status);
+            return r.booking;
+        }
+        // Fallback
         const booking = await this.storage.findBookingById(bookingId);
         if (!booking)
             throw new BookingEngineError("Запись не найдена", "NOT_FOUND");
         if (booking.userEmail.toLowerCase() !== requesterEmail.toLowerCase()) {
             throw new BookingEngineError("Нет доступа к этой записи", "FORBIDDEN");
+        }
+        if (booking.status === "CANCELLED") {
+            throw new BookingEngineError("Запись была отменена", "CANCELLED");
         }
         const key = this.slotKey(booking.resourceId, newStartTime, newEndTime);
         const release = await this.lockProvider.acquire(key, LOCK_TTL_MS);
@@ -327,9 +348,8 @@ class BookingEngine {
         }
         try {
             const available = await this.isSlotAvailable(newStartTime, newEndTime, booking.resourceId, bookingId);
-            if (!available) {
+            if (!available)
                 throw new BookingEngineError("Выбранное время уже занято", "SLOT_TAKEN");
-            }
             await this.storage.updateBookingTime(bookingId, newStartTime, newEndTime);
             this.fireAndForget(this.storage.appendLog({
                 timestamp: (0, dates_1.nowIso)(),
@@ -353,7 +373,6 @@ function safeParse(json) {
         return null;
     }
 }
-/** Экранирует HTML-спецсимволы, чтобы пользовательский ввод не ломал письмо (XSS). */
 function escapeHtml(input) {
     return input
         .replace(/&/g, "&amp;")

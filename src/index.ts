@@ -20,8 +20,8 @@ export type {
   AvailabilitySlot,
 } from "./types";
 
-export { AppsScriptAdapter } from "./adapters/storage/AppsScriptAdapter";
-export type { AppsScriptAdapterConfig } from "./adapters/storage/AppsScriptAdapter";
+export { SupabaseAdapter } from "./adapters/storage/SupabaseAdapter";
+export type { SupabaseAdapterConfig } from "./adapters/storage/SupabaseAdapter";
 
 export { MemoryLockAdapter } from "./adapters/lock/MemoryLockAdapter";
 
@@ -30,3 +30,5 @@ export type { ResendAdapterConfig } from "./adapters/email/ResendAdapter";
 
 export { NodemailerAdapter } from "./adapters/email/NodemailerAdapter";
 export type { NodemailerAdapterConfig } from "./adapters/email/NodemailerAdapter";
+
+export { ConsoleEmailAdapter } from "./adapters/email/ConsoleAdapter";

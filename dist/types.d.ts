@@ -7,7 +7,6 @@ export interface UserRecord {
     createdAt: string;
     [key: string]: unknown;
 }
-/** Работник/ресурс (мастер, парикмахер и т.п.), который принимает записи. */
 export interface ResourceRecord {
     id: string;
     name: string;
@@ -16,7 +15,6 @@ export interface ResourceRecord {
 export interface BookingRecord {
     id: string;
     userEmail: string;
-    /** Работник, на которого сделана запись. */
     resourceId: string;
     startTime: string;
     endTime: string;
@@ -43,17 +41,11 @@ export interface CreateResourceInput {
 }
 export interface CreateBookingInput {
     userEmail: string;
-    /** Необязательно: если не задан — запись «без мастера» (общий слот). */
     resourceId?: string;
     startTime: string;
     endTime: string;
     serviceData?: Record<string, unknown>;
 }
-/**
- * Абстракция над хранилищем данных. AppsScriptAdapter — реализация поверх Google Sheets
- * (через Apps Script). Можно подставить Postgres/Airtable/что угодно, реализовав интерфейс.
- */
-/** Входные данные для атомарного резервирования слота (одна операция "проверка + запись"). */
 export interface ReserveSlotInput {
     id: string;
     userEmail: string;
@@ -62,7 +54,6 @@ export interface ReserveSlotInput {
     endTime: string;
     serviceData: string;
     token: string;
-    /** ISO 8601: PENDING-брони старше этого времени считаются свободными. */
     staleBefore: string;
 }
 export type ReserveSlotResult = {
@@ -72,7 +63,25 @@ export type ReserveSlotResult = {
     reserved: false;
     reason: "SLOT_TAKEN" | "LOCK_BUSY";
 };
-/** Один слот календаря занятости + список свободных работников. */
+export type ConfirmBookingResult = {
+    status: "OK";
+    booking: BookingRecord;
+} | {
+    status: "NOT_FOUND" | "CANCELLED" | "EXPIRED";
+};
+export type CancelBookingResult = {
+    status: "OK" | "NOT_FOUND" | "FORBIDDEN";
+};
+export type RescheduleBookingResult = {
+    status: "OK";
+    booking: BookingRecord;
+} | {
+    status: "NOT_FOUND" | "FORBIDDEN" | "CANCELLED" | "EXPIRED" | "SLOT_TAKEN";
+};
+export interface AvailabilityData {
+    resources: ResourceRecord[];
+    bookings: BookingRecord[];
+}
 export interface AvailabilitySlot {
     startTime: string;
     endTime: string;
@@ -95,16 +104,35 @@ export interface IBookingStorage {
     listBookingsByUser(email: string): Promise<BookingRecord[]>;
     listBookings(): Promise<BookingRecord[]>;
     deleteBooking(id: string): Promise<void>;
-    /**
-     * Опциональная атомарная операция "проверить слот и зарезервировать" за один вызов.
-     * Если хранилище реализует её (AppsScriptAdapter), движок использует её и экономит
-     * один round-trip. Иначе откатывается на isSlotAvailable + createBooking.
-     */
+    /** Опциональная атомарная "проверить слот + записать" за один round-trip. */
     reserveSlot?(input: ReserveSlotInput): Promise<ReserveSlotResult>;
     appendLog(log: LogRecord): Promise<void>;
     listLogs(): Promise<LogRecord[]>;
-    /** Пересобрать человекочитаемый лист «Отчёт» (специфично для Apps Script). */
+    /** Специфично для Apps Script. */
     rebuildReport?(): Promise<void>;
+    /** Идемпотентно подтверждает PENDING. Заменяет findById + update + createUser + log. */
+    confirmBooking?(input: {
+        bookingId: string;
+        staleBefore: string;
+    }): Promise<ConfirmBookingResult>;
+    /** Отмена с проверкой владельца. Идемпотентно для уже отменённой. */
+    cancelBooking?(input: {
+        bookingId: string;
+        requesterEmail: string;
+    }): Promise<CancelBookingResult>;
+    /** Перенос с проверкой владельца, статуса и занятости под одним lock'ом. */
+    rescheduleBooking?(input: {
+        bookingId: string;
+        requesterEmail: string;
+        startTime: string;
+        endTime: string;
+        staleBefore: string;
+    }): Promise<RescheduleBookingResult>;
+    /**
+     * Мастера + брони диапазона одним запросом.
+     * FIX: добавлен staleBefore — сервер сам фильтрует stale-PENDING.
+     */
+    getAvailabilityData?(startTime: string, endTime: string, staleBefore: string): Promise<AvailabilityData>;
 }
 export interface IEmailProvider {
     sendMail(params: {
@@ -115,26 +143,21 @@ export interface IEmailProvider {
     }): Promise<void>;
 }
 export interface ILockProvider {
-    /**
-     * Пытается захватить блокировку по ключу на указанное время (мс).
-     * Возвращает функцию release() для снятия блокировки, либо null, если захватить не удалось.
-     */
     acquire(key: string, ttlMs: number): Promise<(() => Promise<void>) | null>;
 }
 export interface BookingEngineConfig {
     storage: IBookingStorage;
     emailProvider: IEmailProvider;
-    /** Реализация блокировки. По умолчанию — MemoryLockAdapter. */
     lockProvider?: ILockProvider;
     jwtSecret: string;
-    /** Базовый URL приложения, используется для ссылок /api/confirm и /api/login */
     baseUrl: string;
-    /** Сколько минут PENDING-бронь удерживает слот. По умолчанию 15. */
     pendingTtlMinutes?: number;
-    /** TTL JWT-токена в письме подтверждения (мин). По умолчанию 30. */
     confirmTokenTtlMinutes?: number;
-    /** TTL JWT-токена в письме входа (мин). По умолчанию 15. */
     loginTokenTtlMinutes?: number;
-    /** TTL сессионной cookie (дни). По умолчанию 30. */
     sessionTtlDays?: number;
+    /**
+     * Для serverless: продлевает жизнь функции до завершения фоновых логов/писем.
+     * Next.js 15: after(); Vercel: waitUntil из "@vercel/functions".
+     */
+    waitUntil?: (promise: Promise<unknown>) => void;
 }
